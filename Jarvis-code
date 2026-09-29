@@ -1,0 +1,366 @@
+"""
+JARVIS - Hand Gesture + Clap + Voice + EMERGENCY SOS   (PC side, VS Code)  ->  ESP32 se connected
+
+Normal control (jaisa pehle tha):
+    Gesture : 5 ungliyan = Light ON | 0 (mutthi) = Light OFF | 2 = Fan ON | 1 = Fan OFF   (1 sec pakdo)
+    Clap    : PC mic se - ek taali = light ON/OFF badlegi                                 (USE_CLAP)
+    Voice   : "Jarvis light on / light off / fan on / fan off"
+
+EMERGENCY SOS (naya):
+    Gesture : DONO HAATH upar, dono me saari 5 ungliyan khuli (surrender pose)   (1 sec pakdo)
+    Voice   : "Jarvis help"
+    Dono me se koi bhi ho -> ESP32 ko 'E' bhejta hai -> ESP32 SIM800L se SMS bhejta hai, bina internet ke.
+    Jarvis bolta hai: "Emergency alert sent boss"
+
+Har normal action pe bhi Jarvis bolta hai: "Yes boss, light on" (gesture, taali, voice - sab me)
+
+Install:
+    pip install pyserial opencv-python mediapipe sounddevice SpeechRecognition pyaudio pyttsx3 numpy
+"""
+import cv2
+import mediapipe as mp
+import time
+import threading
+import queue
+import numpy as np
+import sounddevice as sd
+import speech_recognition as sr
+import pyttsx3
+
+# ================= सेटिंग्स =================
+USE_ARDUINO = True     # ESP32 se connected. Bina ESP32 test karna ho to False
+COM_PORT = "COM6"      # ESP32 ka port
+BAUD_RATE = 115200     # .ino me bhi 115200 hai
+HOLD_TIME = 1.0        # हाथ का जेस्चर इतने सेकंड पकड़ना है
+EMERGENCY_HOLD_TIME = 1.0   # emergency pose bhi itne sec pakdo (galti se trigger na ho)
+CLAP_THRESHOLD = 0.5   # PC mic ki taali ki sensitivity
+COOLDOWN = 0.3         # एक कमांड के बाद इतने सेकंड दूसरी कमांड नहीं मानेगा
+EMERGENCY_COOLDOWN = 15.0   # ek emergency ke baad itni der dusra nahi bhejega (SMS spam na ho)
+USE_CLAP = True        # PC mic wali taali (ESP32 sensor wali taali chalu karo to isse False karo)
+USE_VOICE = True
+
+# ================= ESP32 se connection =================
+ser = None
+if USE_ARDUINO:
+    try:
+        import serial
+        ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2)   # port khulte hi ESP32 reset hota hai
+        print("ESP32 connected on", COM_PORT)
+    except Exception as e:
+        print("ESP32 connect nahi hua:", e)
+        print("(Arduino Serial Monitor band karo.) Bina ESP32 ke chalta rahega.")
+        ser = None
+
+# ============ Jarvis की आवाज़ (बोलने वाला हिस्सा) ============
+speech_queue = queue.Queue()
+
+def speaker_loop():
+    while True:
+        text = speech_queue.get()
+        try:
+            engine = pyttsx3.init()   # हर बार नई engine (Windows pe reliable rehta hai)
+            engine.say(text)
+            engine.runAndWait()
+            engine.stop()
+            del engine
+        except Exception as e:
+            print("Speak error:", e)
+
+threading.Thread(target=speaker_loop, daemon=True).start()
+
+def speak(text):
+    speech_queue.put(text)
+
+# ============ कमांड भेजना (सारे तरीके यहीं से गुज़रते हैं) ============
+# A = light on | B = light off | C = fan on | D = fan off | E = EMERGENCY SOS
+REPLIES = {
+    "A": "Yes boss, light on",
+    "B": "Yes boss, light off",
+    "C": "Yes boss, fan on",
+    "D": "Yes boss, fan off",
+}
+EMERGENCY_REPLY = "Emergency alert sent boss"
+
+lock = threading.Lock()
+last_action_time = 0
+light_on = False
+fan_on = False
+last_status = "Ready"
+
+last_emergency_time = -999.0
+emergency_lock = threading.Lock()
+
+
+def send(cmd, reply):
+    """Normal command (A/B/C/D) - cooldown me ho to False lautata hai."""
+    global last_action_time, light_on, fan_on, last_status
+    with lock:
+        now = time.time()
+        if now - last_action_time < COOLDOWN:
+            return False
+        last_action_time = now
+        if cmd == "A":
+            light_on = True
+        elif cmd == "B":
+            light_on = False
+        elif cmd == "C":
+            fan_on = True
+        elif cmd == "D":
+            fan_on = False
+        last_status = reply
+    print("Command:", cmd, "|", reply)
+    if ser:
+        try:
+            ser.write(cmd.encode())
+        except Exception as e:
+            print("ESP32 ko bhejne me error:", e)
+    speak(reply)
+    return True
+
+
+def send_emergency(source):
+    """Emergency SOS - apna alag lamba cooldown, taaki SMS spam na ho."""
+    global last_emergency_time, last_status
+    with emergency_lock:
+        now = time.time()
+        if now - last_emergency_time < EMERGENCY_COOLDOWN:
+            return False
+        last_emergency_time = now
+        last_status = EMERGENCY_REPLY
+    print("!!! EMERGENCY triggered by", source, "!!!")
+    if ser:
+        try:
+            ser.write(b"E")
+        except Exception as e:
+            print("ESP32 ko bhejne me error:", e)
+    speak(EMERGENCY_REPLY)
+    return True
+
+# ============ ESP32 se aane wali khabar ============
+def serial_reader():
+    global light_on, fan_on, last_status
+    while ser is not None:
+        try:
+            line = ser.readline().decode(errors="ignore").strip()
+        except Exception:
+            time.sleep(0.2)
+            continue
+        if not line:
+            continue
+        print("ESP32:", line)
+        if line.startswith("LIGHT:"):
+            light_on = line.endswith("1")
+        elif line.startswith("FAN:"):
+            fan_on = line.endswith("1")
+        elif line.startswith("CLAP:"):
+            # ESP32 ke sound sensor ne taali pakdi -> Jarvis bolega
+            reply = REPLIES.get(line[5:6])
+            if reply:
+                last_status = reply
+                speak(reply)
+        elif line.startswith("SOS_SENT"):
+            last_status = "SMS sent!"
+
+# ============ 1) हाथ का जेस्चर (normal + emergency) ============
+# 5 उंगलियां = Light ON | 0 (मुट्ठी) = Light OFF | 2 = Fan ON | 1 = Fan OFF
+ACTIONS = {
+    5: ("A", REPLIES["A"]),
+    0: ("B", REPLIES["B"]),
+    2: ("C", REPLIES["C"]),
+    1: ("D", REPLIES["D"]),
+}
+
+def count_fingers(hand_landmarks, label):
+    lm = hand_landmarks.landmark
+    fingers = []
+    if label == "Right":
+        fingers.append(1 if lm[4].x < lm[3].x else 0)
+    else:
+        fingers.append(1 if lm[4].x > lm[3].x else 0)
+    for tip in [8, 12, 16, 20]:
+        fingers.append(1 if lm[tip].y < lm[tip - 2].y else 0)
+    return sum(fingers)
+
+
+def hand_gesture_loop():
+    mp_hands = mp.solutions.hands
+    mp_draw = mp.solutions.drawing_utils
+    hands = mp_hands.Hands(
+        max_num_hands=2,                     # DONO haath dekhne hain (emergency ke liye)
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7,
+    )
+
+    cap = cv2.VideoCapture(0)
+
+    # normal single-hand gesture
+    last_count = -1
+    hold_start = time.time()
+    last_sent = -1
+
+    # emergency (dono haath, 5-5 ungliyan)
+    emergency_hold_start = None
+    emergency_fired = False
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = hands.process(rgb)
+
+        counts = []
+        if result.multi_hand_landmarks:
+            for hand, handed in zip(result.multi_hand_landmarks, result.multi_handedness):
+                label = handed.classification[0].label
+                mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+                counts.append(count_fingers(hand, label))
+
+        num_hands = len(counts)
+
+        # ---------- EMERGENCY: dono haath, dono me 5 ungliyan (surrender pose) ----------
+        is_emergency_pose = (num_hands == 2 and counts[0] == 5 and counts[1] == 5)
+
+        if is_emergency_pose:
+            if emergency_hold_start is None:
+                emergency_hold_start = time.time()
+            held = time.time() - emergency_hold_start
+            if held >= EMERGENCY_HOLD_TIME and not emergency_fired:
+                if send_emergency("gesture"):
+                    emergency_fired = True
+        else:
+            emergency_hold_start = None
+            emergency_fired = False
+
+        # ---------- NORMAL gesture: sirf ek haath ----------
+        count, name = None, None
+        if num_hands == 1:
+            count = counts[0]
+            name = "Fingers: " + str(count)
+
+        if count != last_count:
+            last_count, hold_start = count, time.time()
+
+        held_normal = time.time() - hold_start
+        if (count is not None and held_normal >= HOLD_TIME
+                and count in ACTIONS and count != last_sent):
+            cmd, reply = ACTIONS[count]
+            if send(cmd, reply):      # cooldown में रुका तो अगली बार फिर कोशिश होगी
+                last_sent = count
+
+        if num_hands != 1:
+            last_count = -1
+            last_sent = -1
+
+        # ---------- screen pe likhna ----------
+        if is_emergency_pose:
+            cv2.putText(frame, "EMERGENCY POSE HELD...", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        elif name:
+            cv2.putText(frame, name, (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        else:
+            cv2.putText(frame, "No Gesture", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        cv2.putText(frame, last_status, (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 200, 0), 2)
+        cv2.putText(frame, "Light: " + ("ON" if light_on else "OFF") +
+                    "   Fan: " + ("ON" if fan_on else "OFF"), (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
+        cv2.imshow("JARVIS - Gesture + Voice + Emergency", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# ============ 2) ताली (PC mic: एक ताली = light ON/OFF बदलेगी) ============
+def clap_loop():
+    def callback(indata, frames, time_info, status):
+        if np.max(np.abs(indata)) > CLAP_THRESHOLD:
+            if light_on:
+                send("B", REPLIES["B"])
+            else:
+                send("A", REPLIES["A"])
+    try:
+        with sd.InputStream(channels=1, callback=callback):
+            while True:
+                time.sleep(0.1)
+    except Exception as e:
+        print("Clap वाले माइक में दिक्कत:", e)
+
+# ============ 3) Jarvis वॉइस कमांड (normal + emergency) ============
+def handle_voice(text):
+    words = text.replace(",", " ").split()
+    if "jarvis" not in words:
+        return
+
+    # ---------- EMERGENCY: "jarvis help" ----------
+    if "help" in words:
+        send_emergency("voice")
+        return
+
+    turn_on = "on" in words or "open" in words
+    turn_off = "off" in words or "close" in words
+
+    if "light" in words:
+        if turn_off:
+            send("B", REPLIES["B"])
+        elif turn_on:
+            send("A", REPLIES["A"])
+    elif "fan" in words:
+        if turn_off:
+            send("D", REPLIES["D"])
+        elif turn_on:
+            send("C", REPLIES["C"])
+
+def voice_loop():
+    recognizer = sr.Recognizer()
+    try:
+        mic = sr.Microphone()
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+    except Exception as e:
+        print("Voice वाले माइक में दिक्कत:", e)
+        return
+    print("Voice तैयार है। बोलो: 'Jarvis light on' ya emergency ke liye 'Jarvis help'")
+
+    while True:
+        try:
+            with mic as source:
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=4)
+            text = recognizer.recognize_google(audio, language="en-IN").lower()
+            print("सुना:", text)
+            handle_voice(text)
+        except sr.WaitTimeoutError:
+            pass
+        except sr.UnknownValueError:
+            pass
+        except sr.RequestError:
+            print("Voice पहचानने के लिए internet चाहिए")
+            time.sleep(2)
+        except Exception as e:
+            print("Voice error:", e)
+
+# ============ सबको एक साथ चलाना ============
+if __name__ == "__main__":
+    speak("Jarvis online. Ready boss")     # startup test
+    if ser:
+        threading.Thread(target=serial_reader, daemon=True).start()
+        try:
+            ser.write(b"S")                # ESP32 se abhi ki light/fan state maango
+        except Exception:
+            pass
+    if USE_CLAP:
+        threading.Thread(target=clap_loop, daemon=True).start()
+    if USE_VOICE:
+        threading.Thread(target=voice_loop, daemon=True).start()
+    try:
+        hand_gesture_loop()   # कैमरा window मुख्य हिस्से में चलती है
+    finally:
+        if ser:
+            ser.close()
